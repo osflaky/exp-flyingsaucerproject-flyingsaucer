@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ${{matrix.os}}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, 
+            macos-latest, macos-15-intel]
+            # The last 2 LTS releases
+        java: [21, 25]
+        exclude:
+                # setup-java has no Temurin 25 for Windows arm64 yet
+        - os: windows-11-arm
+          java: 25
+      fail-fast: false
+      max-parallel: 6
+    name: Java ${{matrix.java}} (${{matrix.os}})
+    steps:
+    - uses: actions/checkout@v7
+    - name: Setup java
+      uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: ${{matrix.java}}
+        cache: maven
+    - name: Cache chrome-headless-shell
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/flying-saucer
+        key: chrome-headless-shell-${{ runner.os }}
+    - name: Build with Maven
+      run: mvn -B package
+    - name: 'Upload test results'
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: test-report-${{matrix.java}}-${{matrix.os}}
+        retention-days: 14
+        path: |
+          **/target/site
+          **/target/surefire-reports
+
+    timeout-minutes: 150

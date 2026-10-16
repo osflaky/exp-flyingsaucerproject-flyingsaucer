@@ -1,0 +1,734 @@
+/*
+ * {{{ header & license
+ * Copyright (c) 2004, 2005 Joshua Marinacci, Torbjoern Gannholm
+ * Copyright (c) 2005 Wisconsin Court System
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * as published by the Free Software Foundation; either version 2.1
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ * }}}
+ */
+package org.xhtmlrenderer.layout;
+
+import org.jspecify.annotations.Nullable;
+import org.xhtmlrenderer.css.constants.CSSName;
+import org.xhtmlrenderer.css.constants.IdentValue;
+import org.xhtmlrenderer.css.style.CalculatedStyle;
+import org.xhtmlrenderer.render.BlockBox;
+import org.xhtmlrenderer.render.Box;
+import org.xhtmlrenderer.render.LineBox;
+import org.xhtmlrenderer.render.PageBox;
+
+import java.awt.Dimension;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.RandomAccess;
+
+import static java.util.Objects.requireNonNullElse;
+
+/**
+ * Utility class for laying block content.  It is called when a block box
+ * contains block level content.  {@link BoxBuilder} will have made sure that
+ * the block we're working on will either contain only inline or block content.
+ * If we're in a paged media environment, the various page break related
+ * properties are also handled here.  If a rule is violated, the affected run
+ * of boxes will be laid out again.  If the rule still cannot be satisfied,
+ * the rule will be dropped.
+ */
+public class BlockBoxing {
+    private static final int NO_PAGE_TRIM = -1;
+
+    private BlockBoxing() {
+    }
+
+    public static void layoutContent(LayoutContext c, BlockBox block, int contentStart) {
+        if (layoutMultiColumnContent(c, block, contentStart)) {
+            return;
+        }
+
+        int offset = -1;
+
+        List<Box> localChildren = block.getChildren();
+        if (c.isPrint() && !(localChildren instanceof RandomAccess)) {
+            localChildren = new ArrayList<>(localChildren);
+        }
+
+        int childOffset = block.getHeight() + contentStart;
+
+        RelayoutDataList relayoutDataList = null;
+        if (c.isPrint()) {
+            relayoutDataList = new RelayoutDataList(localChildren.size());
+        }
+
+        int pageCount = NO_PAGE_TRIM;
+        BlockBox previousChildBox = null;
+        for (Box localChild : localChildren) {
+            BlockBox child = (BlockBox) localChild;
+            offset++;
+
+            RelayoutData relayoutData = null;
+
+            boolean mayCheckKeepTogether = false;
+            if (c.isPrint()) {
+                relayoutData = relayoutDataList.get(offset);
+                relayoutData.setLayoutState(c.copyStateForRelayout());
+                relayoutData.setChildOffset(childOffset);
+                pageCount = c.getRootLayer().getPages().size();
+
+                child.setNeedPageClear(false);
+
+                if ((child.getStyle().isAvoidPageBreakInside() || child.getStyle().isKeepWithInline())
+                        && c.isMayCheckKeepTogether()) {
+                    mayCheckKeepTogether = true;
+                    c.setMayCheckKeepTogether(false);
+                }
+            }
+
+            layoutBlockChild(
+                    c, block, child, false, 0, childOffset, NO_PAGE_TRIM,
+                    relayoutData == null ? null : relayoutData.getLayoutState());
+
+            if (c.isPrint()) {
+                boolean needPageClear = child.isNeedPageClear();
+                if (needPageClear || mayCheckKeepTogether) {
+                    if (mayCheckKeepTogether) c.setMayCheckKeepTogether(true);
+                    boolean tryToAvoidPageBreak = child.getStyle().isAvoidPageBreakInside() && child.crossesPageBreak(c);
+                    boolean keepWithInline = child.isNeedsKeepWithInline(c);
+                    if (tryToAvoidPageBreak || needPageClear || keepWithInline) {
+                        c.restoreStateForRelayout(relayoutData.getLayoutState());
+                        child.reset(c);
+                        layoutBlockChild(
+                                c, block, child, true, 0, childOffset, pageCount, relayoutData.getLayoutState());
+
+                        if (tryToAvoidPageBreak && child.crossesPageBreak(c) && !keepWithInline) {
+                            c.restoreStateForRelayout(relayoutData.getLayoutState());
+                            child.reset(c);
+                            layoutBlockChild(
+                                    c, block, child, false, 0, childOffset, pageCount, relayoutData.getLayoutState());
+                        }
+                    }
+                }
+                c.getRootLayer().ensureHasPage(c, child);
+            }
+
+            Dimension relativeOffset = child.getRelativeOffset();
+            if (relativeOffset == null) {
+                childOffset = child.getY() + child.getHeight();
+            } else {
+                // Box will have been positioned by this point so calculate
+                // relative to where it would have been if it hadn't been
+                // moved
+                childOffset = child.getY() - relativeOffset.height + child.getHeight();
+            }
+
+            if (childOffset > block.getHeight()) {
+                block.setHeight(childOffset);
+            }
+
+            if (c.isPrint()) {
+                if (child.getStyle().isForcePageBreakAfter()) {
+                    block.forcePageBreakAfter(c, child.getStyle().getIdent(CSSName.PAGE_BREAK_AFTER));
+                    childOffset = block.getHeight();
+                }
+
+                if (previousChildBox != null) {
+                    relayoutDataList.markRun(offset, previousChildBox, child);
+                }
+
+                RelayoutRunResult runResult =
+                        processPageBreakAvoidRun(
+                                c, block, localChildren, offset, relayoutDataList, relayoutData);
+                if (runResult.isChanged()) {
+                    childOffset = runResult.getChildOffset();
+                    if (childOffset > block.getHeight()) {
+                        block.setHeight(childOffset);
+                    }
+                }
+            }
+
+            previousChildBox = child;
+        }
+    }
+
+    private static RelayoutRunResult processPageBreakAvoidRun(final LayoutContext c, final BlockBox block,
+                                                              List<Box> localChildren, int offset,
+                                                              RelayoutDataList relayoutDataList, RelayoutData relayoutData) {
+        RelayoutRunResult result = new RelayoutRunResult();
+        if (offset > 0) {
+            boolean mightNeedRelayout = false;
+            int runEnd = -1;
+            if (offset == localChildren.size() - 1 && relayoutData.isEndsRun()) {
+                mightNeedRelayout = true;
+                runEnd = offset;
+            } else if (offset > 0) {
+                RelayoutData previousRelayoutData = relayoutDataList.get(offset - 1);
+                if (previousRelayoutData.isEndsRun()) {
+                    mightNeedRelayout = true;
+                    runEnd = offset - 1;
+                }
+            }
+            if (mightNeedRelayout) {
+                int runStart = relayoutDataList.getRunStart(runEnd);
+                if ( isPageBreakBetweenChildBoxes(runStart, runEnd, c, block) ) {
+                    result.setChanged();
+                    block.resetChildren(c, runStart, offset);
+                    result.setChildOffset(relayoutRun(c, localChildren, block,
+                            relayoutDataList, runStart, offset, true));
+                    if ( isPageBreakBetweenChildBoxes(runStart, runEnd, c, block) ) {
+                        block.resetChildren(c, runStart, offset);
+                        result.setChildOffset(relayoutRun(c, localChildren, block,
+                                relayoutDataList, runStart, offset, false));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private static boolean isPageBreakBetweenChildBoxes(int runStart, int runEnd, LayoutContext c, BlockBox block) {
+        for ( int i = runStart; i < runEnd; i++ ) {
+            Box prevChild = block.getChild(i);
+            Box nextChild = block.getChild(i+1);
+            // if nextChild is made of several lines, then only the first line
+            // is relevant for "page-break-before: avoid".
+            Box nextLine = requireNonNullElse(getFirstLine(nextChild), nextChild);
+            int prevChildEnd = prevChild.getAbsY() + prevChild.getHeight();
+            int nextLineEnd = nextLine.getAbsY() + nextLine.getHeight();
+            if ( c.getRootLayer().crossesPageBreak(c, prevChildEnd, nextLineEnd) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Nullable
+    private static LineBox getFirstLine(Box box) {
+        for ( Box child = box; child.getChildCount()>0; child = child.getChild(0) ) {
+            if ( child instanceof LineBox lineBox) {
+                return lineBox;
+            }
+        }
+        return null;
+    }
+
+    private static int relayoutRun(
+            LayoutContext c, List<Box> localChildren, BlockBox block,
+            RelayoutDataList relayoutDataList, int start, int end, boolean onNewPage) {
+        int childOffset = relayoutDataList.get(start).getChildOffset();
+
+        if (onNewPage) {
+            Box startBox = localChildren.get(start);
+            PageBox startPageBox = c.getRootLayer().getFirstPage(c, startBox);
+            childOffset += startPageBox.getBottom() - startBox.getAbsY();
+        }
+
+        // reset height of parent as it is used for Y-setting of children
+        block.setHeight(childOffset);
+
+
+        for (int i = start; i <= end; i++) {
+            BlockBox child = (BlockBox) localChildren.get(i);
+
+            RelayoutData relayoutData = relayoutDataList.get(i);
+
+            int pageCount = c.getRootLayer().getPages().size();
+
+            //TODO:handle run-ins. For now, treat them as blocks
+
+            c.restoreStateForRelayout(relayoutData.getLayoutState());
+            relayoutData.setChildOffset(childOffset);
+            boolean mayCheckKeepTogether = false;
+            if ((child.getStyle().isAvoidPageBreakInside() || child.getStyle().isKeepWithInline())
+                    && c.isMayCheckKeepTogether()) {
+                mayCheckKeepTogether = true;
+                c.setMayCheckKeepTogether(false);
+            }
+            layoutBlockChild(
+                    c, block, child, false, 0, childOffset, NO_PAGE_TRIM, relayoutData.getLayoutState());
+
+            if (mayCheckKeepTogether) {
+                c.setMayCheckKeepTogether(true);
+                boolean tryToAvoidPageBreak =
+                    child.getStyle().isAvoidPageBreakInside() && child.crossesPageBreak(c);
+                boolean needPageClear = child.isNeedPageClear();
+                boolean keepWithInline = child.isNeedsKeepWithInline(c);
+                if (tryToAvoidPageBreak || needPageClear || keepWithInline) {
+                    c.restoreStateForRelayout(relayoutData.getLayoutState());
+                    child.reset(c);
+                    layoutBlockChild(
+                            c, block, child, true, 0, childOffset, pageCount, relayoutData.getLayoutState());
+
+                    if (tryToAvoidPageBreak && child.crossesPageBreak(c) && !keepWithInline) {
+                        c.restoreStateForRelayout(relayoutData.getLayoutState());
+                        child.reset(c);
+                        layoutBlockChild(
+                                c, block, child, false, 0, childOffset, pageCount, relayoutData.getLayoutState());
+                    }
+                }
+            }
+
+            c.getRootLayer().ensureHasPage(c, child);
+
+            Dimension relativeOffset = child.getRelativeOffset();
+            if (relativeOffset == null) {
+                childOffset = child.getY() + child.getHeight();
+            } else {
+                childOffset = child.getY() - relativeOffset.height + child.getHeight();
+            }
+
+            if (childOffset > block.getHeight()) {
+                block.setHeight(childOffset);
+            }
+
+            if (child.getStyle().isForcePageBreakAfter()) {
+                block.forcePageBreakAfter(c, child.getStyle().getIdent(CSSName.PAGE_BREAK_AFTER));
+                childOffset = block.getHeight();
+            }
+        }
+
+        return childOffset;
+    }
+
+    private static void layoutBlockChild(
+            LayoutContext c, BlockBox parent, BlockBox child,
+            boolean needPageClear, int childX, int childOffset, int trimmedPageCount, LayoutState layoutState) {
+        layoutBlockChild0(c, parent, child, needPageClear, childX, childOffset, trimmedPageCount);
+        BreakAtLineContext bContext = child.calcBreakAtLineContext(c);
+        if (bContext != null) {
+            c.setBreakAtLineContext(bContext);
+            c.restoreStateForRelayout(layoutState);
+            child.reset(c);
+            layoutBlockChild0(c, parent, child, needPageClear, childX, childOffset, trimmedPageCount);
+            c.setBreakAtLineContext(null);
+        }
+    }
+
+    private static void layoutBlockChild0(LayoutContext c, BlockBox parent, BlockBox child,
+            boolean needPageClear, int childX, int childOffset, int trimmedPageCount) {
+        child.setNeedPageClear(needPageClear);
+
+        child.initStaticPos(c, parent, childOffset);
+        child.setX(childX);
+
+        child.initContainingLayer(c);
+        child.calcCanvasLocation();
+
+        c.translate(childX, childOffset);
+        repositionBox(c, child, trimmedPageCount);
+        child.layout(c);
+        c.translate(-child.getX(), -child.getY());
+    }
+
+    private static boolean layoutMultiColumnContent(LayoutContext c, BlockBox block, int contentStart) {
+        int columnCount = resolveColumnCount(c, block);
+        if (columnCount <= 1) {
+            return false;
+        }
+
+        int columnGap = resolveColumnGap(c, block);
+        int savedContentWidth = block.getContentWidth();
+        int columnsAndGapsWidth = savedContentWidth - Math.max(0, (columnCount - 1) * columnGap);
+        int columnWidth = Math.max(1, columnsAndGapsWidth / columnCount);
+        int columnTop = block.getHeight() + contentStart;
+
+        List<Box> children = block.getChildren();
+        try {
+            // Children must resolve widths against column width, not the multicol element's full width.
+            block.setContentWidth(columnWidth);
+
+            int columnHeight = resolveColumnHeightForMultiColumn(
+                    c, block, contentStart, columnCount, children, columnTop);
+
+            int columnIndex = 0;
+            int childOffset = columnTop;
+            int maxColumnBottom = columnTop;
+
+            for (Box localChild : children) {
+                BlockBox child = (BlockBox) localChild;
+                LayoutState state = c.isPrint() ? c.copyStateForRelayout() : null;
+                int startOffset = childOffset;
+                int childX = columnIndex * (columnWidth + columnGap);
+
+                layoutBlockChild(c, block, child, false, childX, childOffset, NO_PAGE_TRIM, state);
+                childOffset = nextBlockChildOffset(child);
+
+                boolean overflowedColumn = childOffset > columnTop + columnHeight;
+                boolean canMoveToNextColumn = columnIndex < columnCount - 1;
+                boolean isFirstInColumn = startOffset == columnTop;
+                if (overflowedColumn && canMoveToNextColumn && !isFirstInColumn) {
+                    if (state != null) {
+                        c.restoreStateForRelayout(state);
+                    }
+                    child.reset(c);
+                    columnIndex++;
+                    childOffset = columnTop;
+                    childX = columnIndex * (columnWidth + columnGap);
+                    layoutBlockChild(c, block, child, false, childX, childOffset, NO_PAGE_TRIM, state);
+                    childOffset = nextBlockChildOffset(child);
+                }
+
+                maxColumnBottom = Math.max(maxColumnBottom, childOffset);
+            }
+
+            block.setHeight(Math.max(block.getHeight(), maxColumnBottom));
+        } finally {
+            block.setContentWidth(savedContentWidth);
+        }
+        return true;
+    }
+
+    private static int nextBlockChildOffset(BlockBox child) {
+        Dimension relativeOffset = child.getRelativeOffset();
+        if (relativeOffset == null) {
+            return child.getY() + child.getHeight();
+        }
+        return child.getY() - relativeOffset.height + child.getHeight();
+    }
+
+    /**
+     * Column height for balancing: when the multicol block has auto height, split total content
+     * height across columns so columns fill sequentially (CSS multi-column balance behavior).
+     * When height is specified, use that as the column box height.
+     */
+    private static int resolveColumnHeightForMultiColumn(
+            LayoutContext c, BlockBox block, int contentStart, int columnCount,
+            List<Box> children, int columnTop) {
+        if (!block.getStyle().isAutoHeight() && block.getStyle().hasAbsoluteUnit(CSSName.HEIGHT)) {
+            int specifiedHeight = (int) block.getStyle().getFloatPropertyProportionalHeight(CSSName.HEIGHT, 0, c);
+            if (specifiedHeight > 0) {
+                return specifiedHeight;
+            }
+        }
+
+        int measureOffset = columnTop;
+        for (Box localChild : children) {
+            BlockBox child = (BlockBox) localChild;
+            LayoutState state = c.isPrint() ? c.copyStateForRelayout() : null;
+            layoutBlockChild(c, block, child, false, 0, measureOffset, NO_PAGE_TRIM, state);
+            measureOffset = nextBlockChildOffset(child);
+        }
+        int totalHeight = measureOffset - columnTop;
+        for (Box localChild : children) {
+            localChild.reset(c);
+        }
+        if (totalHeight <= 0 || children.isEmpty()) {
+            return Math.max(1, (totalHeight + columnCount - 1) / columnCount);
+        }
+
+        int lo = Math.max(1, (totalHeight + columnCount - 1) / columnCount); // ceil(total/n)
+        int hi = totalHeight;
+        int bestH = hi; // safe fallback
+
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+
+            if (contentFitsInColumns(c, block, children, columnTop, columnCount, mid)) {
+                bestH = mid;   // mid works → try smaller
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;  // mid is too small → try larger
+            }
+        }
+
+        bestH = applyFragmentationRules(c, block, children, columnTop, columnCount, bestH);
+        return Math.max(1, bestH);
+    }
+
+    private static boolean contentFitsInColumns(
+            LayoutContext c, BlockBox block, List<Box> children,
+            int columnTop, int columnCount, int columnH) {
+
+        int usedColumns  = 1;
+        int columnUsed   = 0; // height consumed in the current column
+
+        int measureOffset = columnTop;
+        for (Box localChild : children) {
+            BlockBox child = (BlockBox) localChild;
+
+            // Lay out the child to get its real height.
+            LayoutState state = c.isPrint() ? c.copyStateForRelayout() : null;
+            layoutBlockChild(c, block, child, false, 0, measureOffset, NO_PAGE_TRIM, state);
+            int childHeight = child.getHeight();
+            child.reset(c);
+
+            // Would this child overflow the current column?
+            if (columnUsed + childHeight > columnH) {
+                // Move to the next column.
+                usedColumns++;
+                if (usedColumns > columnCount) {
+                    return false; // needs more columns than allowed → H too small
+                }
+                columnUsed = childHeight; // child starts fresh in the new column
+            } else {
+                columnUsed += childHeight;
+            }
+
+            measureOffset = columnTop + columnUsed; // keep offset in sync
+        }
+
+        return true; // all children fit within columnCount columns
+    }
+
+    private static int applyFragmentationRules(
+            LayoutContext c, BlockBox block, List<Box> children,
+            int columnTop, int columnCount, int initialH) {
+
+        int columnH = initialH;
+        boolean changed = true;
+
+        // Iterate until no more adjustments are needed (usually 1–2 passes).
+        while (changed) {
+            changed = false;
+            int columnUsed = 0;
+
+            int measureOffset = columnTop;
+            for (Box localChild : children) {
+                BlockBox child = (BlockBox) localChild;
+
+                // Lay out child to get its real height.
+                LayoutState state = c.isPrint() ? c.copyStateForRelayout() : null;
+                layoutBlockChild(c, block, child, false, 0, measureOffset, NO_PAGE_TRIM, state);
+                int childHeight = child.getHeight();
+                child.reset(c);
+
+                boolean avoidBreakInside = isBreakInsideAvoid(child);
+
+                if (columnUsed + childHeight > columnH) {
+                    // A column break would occur inside this child.
+                    if (avoidBreakInside && childHeight <= columnH) {
+                        // The child fits in one column on its own but is being split.
+                        // Bump H so the break happens *before* this child (i.e. the
+                        // previous column is extended to exactly columnH, and this
+                        // child starts the next column whole).
+                        // We only need to ensure the previous column's used space
+                        // equals columnH — no change to columnH is needed here;
+                        // the child will simply start in the next column.
+                        // BUT if the child itself is taller than columnH we cannot
+                        // avoid the split — leave it as-is.
+                        columnUsed = childHeight; // child starts fresh in next column
+                    } else if (avoidBreakInside && childHeight > columnH) {
+                        // Child is taller than one column; we must expand columnH
+                        // to at least childHeight so it is never split.
+                        int newH = childHeight;
+                        if (newH > columnH) {
+                            columnH = newH;
+                            changed = true;
+                            break; // restart the pass with the new columnH
+                        }
+                        columnUsed = childHeight;
+                    } else {
+                        // No avoid constraint — normal column break.
+                        columnUsed = childHeight;
+                    }
+                } else {
+                    columnUsed += childHeight;
+                }
+
+                measureOffset = columnTop + columnUsed;
+            }
+        }
+
+        return columnH;
+    }
+
+    private static boolean isBreakInsideAvoid(BlockBox child) {
+        CalculatedStyle style = child.getStyle();
+
+        // CSS 2.1 legacy: page-break-inside
+        if (style.isIdent(CSSName.PAGE_BREAK_INSIDE, IdentValue.AVOID)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static int resolveColumnCount(LayoutContext c, BlockBox block) {
+        if (!block.getStyle().isIdent(CSSName.COLUMN_COUNT, IdentValue.AUTO)) {
+            return Math.max(1, (int) block.getStyle().asFloat(CSSName.COLUMN_COUNT));
+        }
+
+        if (block.getStyle().isIdent(CSSName.COLUMN_WIDTH, IdentValue.AUTO)) {
+            return 1;
+        }
+
+        int width = Math.max(1, (int) block.getStyle().getFloatPropertyProportionalWidth(
+                CSSName.COLUMN_WIDTH, block.getContentWidth(), c));
+        int gap = resolveColumnGap(c, block);
+        return Math.max(1, (block.getContentWidth() + gap) / (width + gap));
+    }
+
+    private static int resolveColumnGap(LayoutContext c, BlockBox block) {
+        if (block.getStyle().isIdent(CSSName.COLUMN_GAP, IdentValue.NORMAL)) {
+            return 16;
+        }
+        return Math.max(0, (int) block.getStyle().getFloatPropertyProportionalWidth(
+                CSSName.COLUMN_GAP, block.getContentWidth(), c));
+    }
+
+    private static void repositionBox(LayoutContext c, BlockBox child, int trimmedPageCount) {
+        boolean moved = false;
+        if (child.getStyle().isRelative()) {
+            Dimension delta = child.positionRelative(c);
+            c.translate(delta.width, delta.height);
+            moved = true;
+        }
+        if (c.isPrint()) {
+            boolean pageClear = child.isNeedPageClear() ||
+                                    child.getStyle().isForcePageBreakBefore();
+            boolean needNewPageContext = child.checkPageContext(c);
+
+            if (needNewPageContext && trimmedPageCount != NO_PAGE_TRIM) {
+                c.getRootLayer().trimPageCount(trimmedPageCount);
+            }
+
+            if (pageClear || needNewPageContext) {
+                int delta = child.forcePageBreakBefore(
+                        c,
+                        child.getStyle().getIdent(CSSName.PAGE_BREAK_BEFORE),
+                        needNewPageContext);
+                c.translate(0, delta);
+                moved = true;
+                child.setNeedPageClear(false);
+            }
+        }
+        if (moved) {
+            child.calcCanvasLocation();
+        }
+    }
+
+    private static class RelayoutDataList {
+        private final List<RelayoutData> _hints;
+
+        private RelayoutDataList(int size) {
+            _hints = new ArrayList<>(size);
+            for (int i = 0; i < size; i++) {
+                _hints.add(new RelayoutData());
+            }
+        }
+
+        RelayoutData get(int index) {
+            return _hints.get(index);
+        }
+
+        private void markRun(int offset, BlockBox previous, BlockBox current) {
+            RelayoutData previousData = get(offset - 1);
+            RelayoutData currentData = get(offset);
+
+            IdentValue previousAfter =
+                    previous.getStyle().getIdent(CSSName.PAGE_BREAK_AFTER);
+            IdentValue currentBefore =
+                    current.getStyle().getIdent(CSSName.PAGE_BREAK_BEFORE);
+
+            if (previousAfter == IdentValue.AVOID && currentBefore == IdentValue.AUTO ||
+                previousAfter == IdentValue.AUTO && currentBefore == IdentValue.AVOID ||
+                previousAfter == IdentValue.AVOID && currentBefore == IdentValue.AVOID) {
+                if (!previousData.isInRun()) {
+                    previousData.setStartsRun();
+                }
+                previousData.setInRun();
+                currentData.setInRun();
+
+                if (offset == _hints.size() - 1) {
+                    currentData.setEndsRun();
+                }
+            } else {
+                if (previousData.isInRun()) {
+                    previousData.setEndsRun();
+                }
+            }
+        }
+
+        int getRunStart(int runEnd) {
+            int offset = runEnd;
+            RelayoutData current = get(offset);
+            if (!current.isEndsRun()) {
+                throw new RuntimeException("Not the end of a run");
+            }
+            while (!current.isStartsRun()) {
+                current = get(--offset);
+            }
+            return offset;
+        }
+    }
+
+    private static class RelayoutRunResult {
+        private boolean _changed;
+        private int _childOffset;
+
+        boolean isChanged() {
+            return _changed;
+        }
+
+        private void setChanged() {
+            _changed = true;
+        }
+
+        int getChildOffset() {
+            return _childOffset;
+        }
+
+        private void setChildOffset(int childOffset) {
+            _childOffset = childOffset;
+        }
+    }
+
+    private static class RelayoutData {
+        private LayoutState _layoutState;
+
+        private boolean _startsRun;
+        private boolean _endsRun;
+        private boolean _inRun;
+
+        private int _childOffset;
+
+        boolean isEndsRun() {
+            return _endsRun;
+        }
+
+        private void setEndsRun() {
+            _endsRun = true;
+        }
+
+        boolean isInRun() {
+            return _inRun;
+        }
+
+        private void setInRun() {
+            _inRun = true;
+        }
+
+        LayoutState getLayoutState() {
+            return _layoutState;
+        }
+
+        private void setLayoutState(LayoutState layoutState) {
+            _layoutState = layoutState;
+        }
+
+        boolean isStartsRun() {
+            return _startsRun;
+        }
+
+        private void setStartsRun() {
+            _startsRun = true;
+        }
+
+        int getChildOffset() {
+            return _childOffset;
+        }
+
+        private void setChildOffset(int childOffset) {
+            _childOffset = childOffset;
+        }
+    }
+}
